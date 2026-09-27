@@ -1,0 +1,3 @@
+Classification Report
+=====================
+Placeholder for model evaluation results. Run src/evaluate.py or 02_ml_classification.ipynb to generate final metrics.
