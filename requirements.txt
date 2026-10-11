@@ -6,3 +6,9 @@ matplotlib
 seaborn
 jupyter
 joblib
+astropy
+astroquery
+lightkurve
+tsfresh
+lightgbm
+batman-package
