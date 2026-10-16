@@ -79,3 +79,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Image outputs & plots
+*.png
