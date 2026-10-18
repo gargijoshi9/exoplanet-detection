@@ -77,6 +77,11 @@ models/*
 ehthumbs.db
 Thumbs.db
 
+# Temporary diagnostic scripts
+src/check_features.py
+src/check_flux_quality.py
+src/inspect_lightcurves.py
+
 # Logs
 *.log
 
