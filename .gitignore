@@ -1,3 +1,4 @@
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -32,10 +33,10 @@ env.bak/
 venv.bak/
 
 # Jupyter Notebook
-.ipynb_checkpoints
+.ipynb_checkpoints/
 */.ipynb_checkpoints/*
 
-# Data files (keep folder structure with .gitkeep)
+# Data files
 data/raw/*
 !data/raw/.gitkeep
 data/processed/*
@@ -47,17 +48,22 @@ data/processed/*
 *.hdf5
 *.zip
 *.tar.gz
+*.npz
+*.npy
 
-# Trained models and checkpoints (keep folder structure with .gitkeep)
+# Trained models
+# Keep the final model needed by predict.py
 models/*
 !models/.gitkeep
+!models/lightgbm_bls_pipeline.joblib
+
+# Ignore other model artifacts
 *.pkl
-*.joblib
 *.pt
 *.pth
 *.onnx
 
-# Environment variables & secrets
+# Environment variables and secrets
 .env
 .env.local
 .env.*.local
@@ -81,9 +87,12 @@ Thumbs.db
 src/check_features.py
 src/check_flux_quality.py
 src/inspect_lightcurves.py
+src/compare_bls_features.py
+src/compare_models.py
 
-# Logs
+# Generated reports and logs
+reports/
 *.log
 
-# Image outputs & plots
+# Image outputs and plots
 *.png
