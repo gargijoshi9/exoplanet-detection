@@ -859,3 +859,287 @@ def target_export_payload(tic_id: str, catalog: pd.DataFrame, lc_bundle: dict | 
     if not blocks:
         return pd.DataFrame({"tic_id": [tic_id], "note": ["No saved results were available for this target."]})
     return pd.concat(blocks, ignore_index=True, sort=False)
+
+
+FLAG_METADATA = {
+    "odd_even_mismatch": {
+        "label": "Odd-Even Depth Mismatch (> 3σ)",
+        "description": "Odd and even transit depths differ by > 3σ. Strongly suggests alternating primary and secondary eclipses of an eclipsing binary star system.",
+        "category": "Astrophysical False Positive",
+        "severity": "high",
+    },
+    "secondary_eclipse": {
+        "label": "Secondary Eclipse (> 3σ)",
+        "description": "A secondary dip is detected at phase 0.5 with > 3σ significance, characteristic of a stellar occultation in a binary system.",
+        "category": "Astrophysical False Positive",
+        "severity": "high",
+    },
+    "too_long_for_period": {
+        "label": "Unphysical Duration (T_dur / P > 10%)",
+        "description": "Transit duration exceeds 10% of the orbital period. Keplerian dynamics constrain planetary transits across solar-type stars to T_dur / P < 0.10.",
+        "category": "Orbital Rule",
+        "severity": "medium",
+    },
+    "too_deep": {
+        "label": "Excessive Depth (> 50,000 ppm / 5%)",
+        "description": "Transit depth exceeds 5% of host flux, which exceeds theoretical planetary radius limits and points to a stellar companion.",
+        "category": "Astrophysical False Positive",
+        "severity": "high",
+    },
+    "few_transits": {
+        "label": "Few Transits (< 2 Events)",
+        "description": "Fewer than 2 transit events covered during the observation window, preventing period verification.",
+        "category": "Observational Constraint",
+        "severity": "medium",
+    },
+    "negative_depth": {
+        "label": "Negative / Inverted Depth",
+        "description": "The BLS model fit an emission or brightening spike rather than an absorption dip.",
+        "category": "Detector Artifact",
+        "severity": "high",
+    },
+    "insufficient_data": {
+        "label": "Insufficient Points (< 5 Points)",
+        "description": "Fewer than 5 valid finite observations in the input series.",
+        "category": "Data Quality",
+        "severity": "high",
+    },
+    "compute_stats_failed": {
+        "label": "Stats Computation Failed",
+        "description": "Astropy BoxLeastSquares was unable to compute secondary and odd/even statistics.",
+        "category": "Algorithmic Error",
+        "severity": "high",
+    },
+}
+
+
+def explain_flag(flag: str) -> dict:
+    flag_key = str(flag).strip().lower()
+    if flag_key in FLAG_METADATA:
+        return FLAG_METADATA[flag_key]
+    return {
+        "label": flag,
+        "description": f"Triggered diagnostic flag: {flag}.",
+        "category": "Diagnostic Flag",
+        "severity": "medium",
+    }
+
+
+def calculate_transit_windows(
+    time_min: float, time_max: float, period_d: float, t0_btjd: float, duration_h: float
+) -> list[dict]:
+    """Calculate expected transit epochs and windows within [time_min, time_max]."""
+    if not (np.isfinite(period_d) and period_d > 0 and np.isfinite(t0_btjd) and np.isfinite(duration_h) and duration_h > 0):
+        return []
+    dur_d = duration_h / 24.0
+    half_dur = dur_d / 2.0
+    n_start = int(np.floor((time_min - t0_btjd - half_dur) / period_d))
+    n_end = int(np.ceil((time_max - t0_btjd + half_dur) / period_d))
+    windows = []
+    for n in range(n_start, n_end + 1):
+        mid = t0_btjd + n * period_d
+        start = mid - half_dur
+        end = mid + half_dur
+        if end >= time_min and start <= time_max:
+            windows.append({
+                "transit_num": n,
+                "t_mid": float(mid),
+                "t_start": float(start),
+                "t_end": float(end),
+            })
+    return windows
+
+
+def load_uploaded_lightcurve(uploaded_file) -> dict:
+    """Safely parse and validate an uploaded .npz or .csv light curve file in memory."""
+    max_bytes = 25 * 1024 * 1024  # 25 MB limit
+    file_size = getattr(uploaded_file, "size", None)
+    if file_size is None and hasattr(uploaded_file, "getvalue"):
+        file_size = len(uploaded_file.getvalue())
+    elif file_size is None:
+        file_size = 0
+
+    if file_size > max_bytes:
+        return {
+            "status": "error",
+            "path": None,
+            "description": "Uploaded light curve",
+            "data": None,
+            "message": f"File size exceeds 25 MB limit ({file_size / (1024*1024):.1f} MB).",
+        }
+    filename = getattr(uploaded_file, "name", "uploaded_file.csv")
+    suffix = Path(filename).suffix.lower()
+
+    try:
+        if suffix == ".npz":
+            data_bytes = io.BytesIO(uploaded_file.getvalue())
+            with np.load(data_bytes) as npz:
+                files = set(npz.files)
+                if "time" not in files or "flux" not in files:
+                    return {
+                        "status": "error",
+                        "path": None,
+                        "description": "Uploaded light curve",
+                        "data": None,
+                        "message": f"NPZ file missing required arrays 'time' and 'flux'. Found: {list(files)}",
+                    }
+                time_arr = npz["time"].astype(float)
+                flux_arr = npz["flux"].astype(float)
+                err_arr = npz["flux_err"].astype(float) if "flux_err" in files else None
+                flux_norm = npz["flux_norm"].astype(float) if "flux_norm" in files else None
+                sector = npz["sector"] if "sector" in files else None
+            df = pd.DataFrame({"time": time_arr, "flux": flux_arr})
+            if err_arr is not None and len(err_arr) == len(df):
+                df["flux_err"] = err_arr
+            if flux_norm is not None and len(flux_norm) == len(df):
+                df["flux_norm"] = flux_norm
+            stages = {
+                "normalized_detrended": "flux",
+                "normalized_not_detrended": "flux_norm" if "flux_norm" in df.columns else None,
+                "raw": None,
+                "cleaned": None,
+            }
+            notes = [
+                f"Uploaded NPZ file '{filename}' with {len(df):,} data points.",
+                "Contents: time, flux" + (", flux_err" if "flux_err" in df.columns else "") + (", flux_norm" if "flux_norm" in df.columns else ""),
+            ]
+        elif suffix == ".csv":
+            df_raw = pd.read_csv(uploaded_file)
+            col_map = {str(c).strip().lower(): c for c in df_raw.columns}
+            if "time" not in col_map or "flux" not in col_map:
+                return {
+                    "status": "error",
+                    "path": None,
+                    "description": "Uploaded light curve",
+                    "data": None,
+                    "message": f"CSV must contain 'time' and 'flux' columns (case-insensitive). Found: {list(df_raw.columns)}",
+                }
+            df = pd.DataFrame({
+                "time": pd.to_numeric(df_raw[col_map["time"]], errors="coerce").astype(float),
+                "flux": pd.to_numeric(df_raw[col_map["flux"]], errors="coerce").astype(float),
+            })
+            err_col = col_map.get("flux_err") or col_map.get("flux_error") or col_map.get("err")
+            if err_col is not None:
+                df["flux_err"] = pd.to_numeric(df_raw[err_col], errors="coerce").astype(float)
+            if "flux_norm" in col_map:
+                df["flux_norm"] = pd.to_numeric(df_raw[col_map["flux_norm"]], errors="coerce").astype(float)
+            stages = {
+                "normalized_detrended": "flux",
+                "normalized_not_detrended": "flux_norm" if "flux_norm" in df.columns else None,
+                "raw": None,
+                "cleaned": None,
+            }
+            notes = [f"Uploaded CSV file '{filename}' with {len(df):,} data points."]
+        else:
+            return {
+                "status": "error",
+                "path": None,
+                "description": "Uploaded light curve",
+                "data": None,
+                "message": f"Unsupported file extension '{suffix}'. Please upload a .npz or .csv light-curve file.",
+            }
+
+        valid = np.isfinite(df["time"]) & np.isfinite(df["flux"])
+        df = df[valid].sort_values("time").reset_index(drop=True)
+        if len(df) < 10:
+            return {
+                "status": "error",
+                "path": None,
+                "description": "Uploaded light curve",
+                "data": None,
+                "message": f"Light curve contains too few valid observations ({len(df)} points). At least 10 points are required.",
+            }
+
+        tic_id = normalize_tic(filename) or "Custom"
+        stats = lightcurve_stats(df, tic_id)
+
+        return {
+            "status": "loaded",
+            "path": Path(filename),
+            "description": f"Uploaded file ({filename})",
+            "data": df,
+            "stages": stages,
+            "stats": stats,
+            "notes": notes,
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "path": None,
+            "description": "Uploaded light curve",
+            "data": None,
+            "message": f"Failed to parse uploaded file '{filename}': {exc}",
+        }
+
+
+def interpret_prediction(
+    predicted_class: str,
+    probabilities: dict | None,
+    bls_values: dict | None,
+    diagnostics: dict | None,
+) -> str:
+    """Generate a scientific narrative interpretation of the model classification."""
+    probs = probabilities or {}
+    bls = bls_values or {}
+    diag = diagnostics or {}
+
+    score = probs.get(predicted_class, 0.0)
+    score_str = f"{score * 100:.1f}%" if score > 0 else "N/A"
+
+    period = bls.get("period_d")
+    depth = bls.get("depth_ppm")
+    snr = bls.get("snr")
+    sde = bls.get("sde")
+    odd_even = bls.get("odd_even_sigma")
+    sec_sigma = bls.get("secondary_sigma")
+    flags = diag.get("flags") or []
+
+    if predicted_class == "Transit":
+        msg = f"The LightGBM model classified this target as a **Transit** candidate with an output model score of **{score_str}**."
+        details = []
+        if period is not None and np.isfinite(period):
+            details.append(f"orbital period of **{period:.4f} days**")
+        if depth is not None and np.isfinite(depth):
+            details.append(f"transit depth of **{depth:.0f} ppm** ({depth / 10000:.3f}%)")
+        if snr is not None and np.isfinite(snr):
+            details.append(f"signal-to-noise ratio SNR = **{snr:.1f}** (SDE = {sde:.1f})" if sde is not None else f"SNR = **{snr:.1f}**")
+        if details:
+            msg += f" The detected signal demonstrates an {', a '.join(details)}."
+
+        if odd_even is not None and np.isfinite(odd_even) and odd_even <= 3.0:
+            msg += f" Odd-even transit symmetry is consistent ({odd_even:.2f}σ <= 3.0σ), disfavoring an eclipsing binary."
+        if sec_sigma is not None and np.isfinite(sec_sigma) and sec_sigma <= 3.0:
+            msg += f" No statistically significant secondary eclipse was detected at phase 0.5 ({sec_sigma:.2f}σ <= 3.0σ), supporting a planetary transit interpretation."
+        return msg
+
+    elif predicted_class == "Eclipsing Binary":
+        msg = f"The LightGBM model classified this target as an **Eclipsing Binary (EB)** with an output model score of **{score_str}**."
+        eb_reasons = []
+        if odd_even is not None and np.isfinite(odd_even) and odd_even > 3.0:
+            eb_reasons.append(f"significant odd-even depth difference of **{odd_even:.2f}σ** (primary vs. secondary transit mismatch)")
+        if sec_sigma is not None and np.isfinite(sec_sigma) and sec_sigma > 3.0:
+            eb_reasons.append(f"a detectable secondary eclipse at phase 0.5 (**{sec_sigma:.2f}σ**)")
+        if depth is not None and np.isfinite(depth) and depth > 50000:
+            eb_reasons.append(f"a deep transit depth of **{depth:.0f} ppm** ({depth / 10000:.1f}%), exceeding typical exoplanetary radii")
+        if "too_long_for_period" in flags:
+            eb_reasons.append("a transit duration that exceeds orbital kinematic limits for planetary bodies")
+
+        if eb_reasons:
+            msg += f" This classification is supported by {', '.join(eb_reasons)}."
+        else:
+            msg += " The combination of statistical transit shape features and BLS depth signatures closely matches the eclipsing binary training distribution."
+        return msg
+
+    else:  # Other
+        msg = f"The LightGBM model classified this target as **Other** with an output model score of **{score_str}**."
+        reasons = []
+        if snr is not None and np.isfinite(snr) and snr < 7.1:
+            reasons.append(f"low BLS detection significance (SNR = {snr:.1f} < 7.1)")
+        if flags:
+            reasons.append(f"diagnostic flags: `{', '.join(flags)}`")
+        if reasons:
+            msg += f" The signal exhibits {', '.join(reasons)}, consistent with stellar variability, instrumental noise artifacts, or unclassified non-planetary fluctuations."
+        else:
+            msg += " The extracted photometric features and transit parameters are inconsistent with coherent planetary transits or clean eclipsing binaries."
+        return msg
+
