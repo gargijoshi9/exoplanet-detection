@@ -12,3 +12,5 @@ lightkurve
 tsfresh
 lightgbm
 batman-package
+streamlit
+plotly

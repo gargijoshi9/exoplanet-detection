@@ -29,15 +29,79 @@ exoplanet-detection/
 │   ├── preprocess.py         # downloads and cleans light curves (all stars, or one star with --tic)
 │   ├── detect.py             # transit detection: BLS search, vetting, multi-planet masking
 │   ├── feature_extraction.py
+│   ├── extract_bls_features.py
 │   ├── train_classifier.py
-│   └── evaluate.py
+│   ├── train_final_model.py
+│   ├── evaluate.py
+│   ├── evaluate_final_model.py
+│   ├── predict.py
+│   └── dashboard_utils.py    # artifact loading for the Streamlit app
 │
+├── app.py                    # Streamlit dashboard
 ├── models/
 ├── results/
 │   └── detection/            # detection tables and plots (created by detect.py)
 ├── requirements.txt
 └── README.md
 ```
+
+## Streamlit dashboard
+
+The interactive dashboard is `app.py`. It reads artifacts from the repository root
+using `pathlib`, so it does not matter which directory you launch it from.
+
+```bash
+python -m venv venv
+source venv/bin/activate        # Linux / macOS
+venv\Scripts\activate           # Windows
+pip install -r requirements.txt
+python -m streamlit run app.py
+```
+
+Then open the URL printed in the terminal (typically http://localhost:8501).
+
+### Dashboard pages
+
+| Page | What it shows |
+|---|---|
+| Project overview | Target counts, candidate counts, class counts, and evaluation metrics computed from files that actually exist |
+| Light curve explorer | Processed flux vs time for a selected TIC, with error bars when `flux_err` is stored |
+| BLS detection | Saved detection tables and, optionally, a live `src/detect.py` run (this can take several minutes) |
+| ML classification | The saved `models/lightgbm_bls_pipeline.joblib` model, live inference, and held-out metrics when present |
+| Transit parameter fitting | Status only; fitting is not implemented in this repository |
+| Results and export | Searchable catalog and CSV download of displayed / per-target rows |
+
+The dashboard never fills missing photometry, detections, or scores with demo values.
+BLS and live classification run only after you submit the on-page form.
+
+### Files the dashboard looks for
+
+| Path | Role |
+|---|---|
+| `data/labels.csv` | Star list, class labels, train/test split |
+| `data/processed/TIC_<id>.npz` | Batch processed light curves |
+| `data/processed/processed_TIC_<id>.csv` or `data/full/processed_TIC_<id>.csv` | Full-cadence CSV light curves |
+| `data/features.csv` | Statistical features |
+| `data/features/bls_features.csv` | Saved first-signal BLS features |
+| `results/detection/<name>_detections.csv` | Per-target detection tables |
+| `results/detection/<name>_periodogram_<n>.png` | Periodogram images (arrays are not saved) |
+| `models/lightgbm_bls_pipeline.joblib` | LightGBM + BLS classifier |
+| `reports/final_evaluation/test_predictions.csv` | Held-out test predictions used for metrics |
+
+If a file is absent, the corresponding card shows **n/a** (unavailable), which is not the same as zero.
+
+In a typical fresh clone you will have the model file but not `labels.csv` or
+detection tables. One full-cadence light curve may exist locally as
+`data/processed/processed_TIC_307210830.csv` (columns `time`, `flux`, `flux_err`)
+even when `data/full/` is empty.
+
+### Dashboard limitations
+
+- Transit parameter fitting is not available; the fitting page states that explicitly.
+- Periodogram *arrays* exist only during an in-session BLS run. Saved detector output is a CSV plus PNG images.
+- Held-out accuracy / precision / recall / F1 are shown only if `reports/final_evaluation/test_predictions.csv` exists. `results/classification_report.txt` is a placeholder and is not treated as a metric source.
+- `predict_proba` values are model scores, not calibrated probabilities of being correct.
+- Large light curves are downsampled in plots only; summary statistics use the full series.
 
 ## Setup & Installation
 
@@ -57,14 +121,21 @@ downloaded from NASA / MAST.
 
 ## Pipeline Status
 
+Status below is what the **code** in this repository implements. Whether a given
+checkout has the data files is a separate question: `data/labels.csv`, most
+processed NPZ files, detection CSVs, and `reports/final_evaluation/` are gitignored
+and must be created locally.
+
 | Stage | Status |
 |---|---|
-| 1. Build labelled star list (`build_labels.py`) | Done |
-| 2. Download and preprocess light curves (`preprocess.py`) | Done |
-| 3. Transit detection (`detect.py`, `notebooks/detection.ipynb`) | Done |
-| 4. Transit parameter fitting | Not started |
-| 5. Feature extraction (`feature_extraction.py`) | Not started (placeholder) |
-| 6. Classifier training and evaluation | Not started |
+| 1. Build labelled star list (`build_labels.py`) | Implemented |
+| 2. Download and preprocess light curves (`preprocess.py`) | Implemented |
+| 3. Transit detection (`detect.py`, `notebooks/detection.ipynb`) | Implemented |
+| 4. Transit parameter fitting | Not implemented (dashboard states this explicitly) |
+| 5. Feature extraction (`feature_extraction.py`, `extract_bls_features.py`) | Implemented |
+| 6. Classifier training (`train_final_model.py`) | Implemented; `models/lightgbm_bls_pipeline.joblib` is versioned |
+| 7. Held-out evaluation (`evaluate_final_model.py`) | Implemented; writes `reports/final_evaluation/` (gitignored) |
+| 8. Streamlit dashboard (`app.py`) | Implemented |
 
 ---
 
@@ -353,9 +424,11 @@ most likely a false positive, so the vetting is doing its job.
 1. **Transit parameter fitting** (starting from the BLS values and using `batman`): fit the radius ratio, impact
    parameter, scaled semi-major axis and mid-transit time with uncertainties, re-flattening `flux_norm` with
    the transits masked.
-2. **Feature extraction** from the light curves and the detection results.
-3. **Classifier training and evaluation** (stratified cross-validation, balanced class weights, per-class
-   metrics).
+2. **Regenerate local artifacts** on machines that only have the code: `labels.csv`, processed NPZ files,
+   `data/features.csv`, `data/features/bls_features.csv`, detection CSVs, and
+   `reports/final_evaluation/test_predictions.csv`.
+3. **Optional:** persist a BLS run from the dashboard (checkbox on the detection page) so overview counts
+   can be computed from `results/detection/` instead of only from an in-session table.
 
 ## Data Sources
 
