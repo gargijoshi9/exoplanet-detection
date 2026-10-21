@@ -68,7 +68,7 @@ Then open the URL printed in the terminal (typically http://localhost:8501).
 | Light curve explorer | Processed flux vs time for a selected TIC, with error bars when `flux_err` is stored |
 | BLS detection | Saved detection tables and, optionally, a live `src/detect.py` run (this can take several minutes) |
 | ML classification | The saved `models/lightgbm_bls_pipeline.joblib` model, live inference, and held-out metrics when present |
-| Transit parameter fitting | Status only; fitting is not implemented in this repository |
+| Transit parameter fitting | Refines BLS detections using a physical `batman` model to estimate radius ratio, impact parameter, and mid-transit time |
 | Results and export | Searchable catalog and CSV download of displayed / per-target rows |
 
 The dashboard never fills missing photometry, detections, or scores with demo values.
@@ -131,7 +131,7 @@ and must be created locally.
 | 1. Build labelled star list (`build_labels.py`) | Implemented |
 | 2. Download and preprocess light curves (`preprocess.py`) | Implemented |
 | 3. Transit detection (`detect.py`, `notebooks/detection.ipynb`) | Implemented |
-| 4. Transit parameter fitting | Not implemented (dashboard states this explicitly) |
+| 4. Transit parameter fitting (`src/fit.py`) | Implemented |
 | 5. Feature extraction (`feature_extraction.py`, `extract_bls_features.py`) | Implemented |
 | 6. Classifier training (`train_final_model.py`) | Implemented; `models/lightgbm_bls_pipeline.joblib` is versioned |
 | 7. Held-out evaluation (`evaluate_final_model.py`) | Implemented; writes `reports/final_evaluation/` (gitignored) |
@@ -419,7 +419,7 @@ most likely a false positive, so the vetting is doing its job.
 
 ---
 
-## Remaining work
+## Completed Work
 
 1. **Transit parameter fitting** (starting from the BLS values and using `batman`): fit the radius ratio, impact
    parameter, scaled semi-major axis and mid-transit time with uncertainties, re-flattening `flux_norm` with

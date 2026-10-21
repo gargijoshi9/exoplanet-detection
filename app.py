@@ -28,7 +28,7 @@ if str(SRC_DIR) not in sys.path:
 
 import dashboard_utils as du
 
-PAGES = ["Overview", "Analyze", "Model Performance"]
+PAGES = ["Overview", "Analyze", "Parameter Fitting", "Model Performance"]
 
 PLOTLY_LAYOUT = dict(
     paper_bgcolor="rgba(7, 13, 24, 0)",
@@ -249,14 +249,36 @@ def detection_table_for(tic: str, files: dict) -> tuple[pd.DataFrame | None, str
     if info:
         loaded = cached_detection_csv(str(info["csv"]))
         if loaded["status"] == "loaded":
-            return loaded["data"], f"Saved file {info['csv'].relative_to(du.ROOT)}"
+            df_det = loaded["data"].copy()
+            if "t0" in df_det.columns and "t0_btjd" not in df_det.columns:
+                df_det = df_det.rename(columns={"t0": "t0_btjd"})
+            return df_det, f"Saved file {info['csv'].relative_to(du.ROOT)}"
     bls = du.load_bls_features()
     if bls["status"] == "loaded" and "tic_id" in bls["data"].columns:
         sub = bls["data"].copy()
         sub["tic_id"] = sub["tic_id"].map(du.normalize_tic)
         sub = sub[sub["tic_id"] == str(tic)]
         if not sub.empty:
-            return sub.reset_index(drop=True), f"Saved BLS features {du.BLS_FEATURES_PATH.relative_to(du.ROOT)}"
+            sub = sub.reset_index(drop=True)
+            if "t0_btjd" not in sub.columns and "t0" in sub.columns:
+                sub["t0_btjd"] = sub["t0"]
+            elif "t0_btjd" not in sub.columns:
+                # Pre-calculate t0 using light curve if available
+                lc_files = files.get("lightcurves", [])
+                if lc_files:
+                    bundle = cached_lightcurve(str(lc_files[0]["path"]))
+                    if bundle["status"] == "loaded":
+                        try:
+                            from astropy.timeseries import BoxLeastSquares
+                            lc_df = bundle["data"]
+                            p_v = float(sub.iloc[0]["period_d"])
+                            d_v = float(sub.iloc[0]["duration_h"]) / 24.0
+                            bls_calc = BoxLeastSquares(lc_df["time"].values, lc_df["flux"].values)
+                            res_calc = bls_calc.power([p_v], [d_v])
+                            sub["t0_btjd"] = float(res_calc.transit_time[0])
+                        except Exception:
+                            sub["t0_btjd"] = np.nan
+            return sub, f"Saved BLS features {du.BLS_FEATURES_PATH.relative_to(du.ROOT)}"
     return None, "No saved detection table for this target."
 
 
@@ -642,20 +664,259 @@ def page_analyze(tic: str | None, files: dict):
                 """,
                 unsafe_allow_html=True,
             )
-    else:
-        st.markdown(
-            """
-            <div style="background: rgba(6, 36, 25, 0.7); border-left: 3px solid #10b981; border-radius: 6px; padding: 0.5rem 0.8rem; font-size: 0.84rem; color: #a7f3d0;">
-                ✅ <strong>Clean Vetting Profile:</strong> No diagnostic vetting flags triggered.
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    # New: Link to Parameter Fitting
+    if pred_class == "Transit":
+        st.markdown("<div style='height: 1rem;'></div>", unsafe_allow_html=True)
+        if st.button("⚙️ Proceed to Parameter Fitting ➔", use_container_width=True):
+            st.session_state["current_page"] = "Parameter Fitting"
+            st.rerun()
 
 
 # ==============================================================================
 # 3. MODEL PERFORMANCE PAGE
 # ==============================================================================
+def page_fitting(tic: str | None, files: dict):
+    import src.fit as fit_mod
+
+    st.markdown(
+        """
+        <div class="app-hero">
+            <h1>Transit Parameter Fitting</h1>
+            <p>
+                Refining the box-shaped BLS detection into a physically accurate
+                <strong>Batman</strong> transit model to estimate the planet-to-star radius ratio and impact parameter.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if tic is None:
+        st.warning("Please select a target TIC ID from the sidebar.")
+        return
+
+    # Check target classification for scientific context
+    cat_row = files.get("catalog_row")
+    label = cat_row.iloc[0]["label"] if (cat_row is not None and not cat_row.empty and pd.notna(cat_row.iloc[0]["label"])) else None
+    if label and label != "Transit":
+        st.info(
+            f"ℹ️ **Astrophysical Context**: Target **TIC {tic}** is classified in the catalog as **{label}**. "
+            "Transit parameter fitting using `batman` implements the Mandel & Agol (2002) model, which physically assumes "
+            "a dark exoplanet occulting a single star. For an Eclipsing Binary or variable star, fitting a planetary model "
+            "is mathematically possible for demonstration, but physically uncalibrated (binary stars require multi-body codes like PHOEBE)."
+        )
+
+    lc_files = files.get("lightcurves", [])
+    if not lc_files:
+        st.error(f"No processed light-curve file was found for TIC {tic}.")
+        return
+
+    # 1. Setup and Data Loading
+    bundle = cached_lightcurve(str(lc_files[0]["path"]))
+    if bundle["status"] != "loaded":
+        st.error(bundle.get("message") or "Failed to load light curve.")
+        return
+
+    df = bundle["data"]
+
+    det_table, source = detection_table_for(tic, files)
+    if det_table is None or det_table.empty:
+        st.warning(f"No prior BLS detection table was found for TIC {tic}.")
+        if st.button("🔍 Run Quick BLS Transit Search", use_container_width=True):
+            with st.spinner("Searching for periodic transits with Astropy BLS..."):
+                try:
+                    from astropy.timeseries import BoxLeastSquares
+                    t_arr = df['time'].values
+                    f_arr = df['flux'].values
+                    e_arr = df['flux_err'].values if 'flux_err' in df else None
+                    baseline = t_arr.max() - t_arr.min()
+                    periods = np.exp(np.linspace(np.log(0.5), np.log(min(20.0, baseline / 2.0)), 1500))
+                    durations = np.array([0.05, 0.1, 0.15])
+                    bls = BoxLeastSquares(t_arr, f_arr, dy=e_arr)
+                    res = bls.power(periods, durations, objective="snr")
+                    i_best = int(np.nanargmax(res.power))
+                    quick_det = pd.DataFrame([{
+                        'signal_id': 1,
+                        'period_d': float(res.period[i_best]),
+                        'duration_h': float(res.duration[i_best] * 24.0),
+                        't0_btjd': float(res.transit_time[i_best]),
+                        'depth_ppm': float(res.depth[i_best] * 1e6),
+                        'snr': float(res.depth_snr[i_best]),
+                        'status': 'detected'
+                    }])
+                    st.session_state.setdefault("detection_runs", {})[str(tic)] = {
+                        "table": quick_det,
+                        "source": "In-session Quick BLS"
+                    }
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"BLS search failed: {e}")
+        return
+
+    st.markdown(f"**Data Source:** {source}")
+
+    # 2. Planet Selection
+    planet_options = [
+        f"Planet {i+1} (P={float(p):.4f}d, Depth={float(d):.0f}ppm)"
+        for i, (p, d) in enumerate(zip(det_table['period_d'], det_table['depth_ppm']))
+    ]
+
+    selected_planet_str = st.selectbox("Select Detected Signal to Fit", planet_options)
+    planet_idx = planet_options.index(selected_planet_str)
+
+    # Get BLS parameters for the selected planet
+    row = det_table.iloc[planet_idx]
+    p_bls = float(row.get('period_d', row.get('period', 3.0)))
+    dur_bls = float(row.get('duration_h', row.get('duration', 2.0)))
+    depth_bls = float(row.get('depth_ppm', row.get('depth', 1000.0)))
+
+    # Robust t0_btjd resolution
+    if 't0_btjd' in row and pd.notna(row['t0_btjd']):
+        t0_bls = float(row['t0_btjd'])
+    elif 't0' in row and pd.notna(row['t0']):
+        t0_bls = float(row['t0'])
+    else:
+        from astropy.timeseries import BoxLeastSquares
+        t_arr = df['time'].values
+        f_arr = df['flux'].values
+        e_arr = df['flux_err'].values if 'flux_err' in df else None
+        bls_tmp = BoxLeastSquares(t_arr, f_arr, dy=e_arr)
+        res_tmp = bls_tmp.power([p_bls], [dur_bls / 24.0])
+        t0_bls = float(res_tmp.transit_time[0])
+
+    # 3. Execute Fitting
+    if st.button("⚡ Fit Transit Model", use_container_width=True):
+        with st.spinner("Re-flattening and optimizing Batman model..."):
+            try:
+                init_dict = {
+                    "period": p_bls,
+                    "t0": t0_bls,
+                    "duration": dur_bls,
+                    "depth": depth_bls * 1e-6 if depth_bls > 1.0 else depth_bls,
+                }
+                best_params, success = fit_mod.run_fitting_pipeline(
+                    tic, planet_idx=planet_idx, initial_params=init_dict
+                )
+                st.session_state[f"fit_{tic}_{planet_idx}"] = (best_params, success)
+                if success:
+                    st.success("Fitting converged successfully!")
+                else:
+                    st.warning("Optimizer finished, but convergence was not guaranteed.")
+            except Exception as e:
+                st.error(f"Fitting failed: {e}")
+
+    # 4. Check for session state or pre-existing saved fit results
+    fit_res = st.session_state.get(f"fit_{tic}_{planet_idx}")
+    if not fit_res:
+        saved_fit_path = ROOT / "results" / "fitting" / f"TIC_{tic}_fit_params.csv"
+        if saved_fit_path.exists():
+            try:
+                saved_df = pd.read_csv(saved_fit_path)
+                if not saved_df.empty:
+                    s_row = saved_df.iloc[0]
+                    fit_res = (
+                        [float(s_row['rp_rs']), float(s_row['b']), float(s_row['a_rs']), float(s_row['t0'])],
+                        bool(s_row.get('success', True))
+                    )
+                    st.session_state[f"fit_{tic}_{planet_idx}"] = fit_res
+            except Exception:
+                pass
+
+    if fit_res:
+        params, success = fit_res
+        rp_rs, b, a_rs, t0_fit = params
+
+        st.markdown("<div style='height: 0.8rem;'></div>", unsafe_allow_html=True)
+        st.markdown("### 🎯 Refined Physical Parameters")
+
+        # Display Parameters
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Radius Ratio (Rp/Rs)", f"{rp_rs:.5f}", help="Planet radius relative to stellar radius")
+        c2.metric("Impact Parameter (b)", f"{b:.3f}", help="Projected distance of transit chord to stellar center [0, 1]")
+        c3.metric("Semi-major Axis (a/Rs)", f"{a_rs:.2f}", help="Orbital distance in stellar radii")
+        c4.metric("Mid-Transit Epoch (T0)", f"{t0_fit:.5f} BTJD", help="Refined mid-transit time in BTJD")
+
+        # Transit zoom options
+        dur_days = dur_bls / 24.0
+        c_zoom, c_info = st.columns([1, 2])
+        with c_zoom:
+            view_mode = st.radio("Phase View", ["Transit Window (Zoom)", "Full Phase"], horizontal=True)
+
+        if view_mode == "Transit Window (Zoom)":
+            plot_window = max(2.5 * dur_days, 0.05 * p_bls)
+        else:
+            plot_window = 0.5 * p_bls
+
+        # Generate batman model curve centered at phase 0
+        import batman
+        t_model = np.linspace(-plot_window, plot_window, 800)
+        p_model = batman.TransitParams()
+        p_model.t0 = 0.0
+        p_model.per = float(p_bls)
+        p_model.rp = float(max(1e-5, rp_rs))
+        p_model.a = float(max(1.1, a_rs))
+        cos_i = np.clip(b / p_model.a, 0.0, 1.0)
+        p_model.inc = float(np.degrees(np.arccos(cos_i)))
+        p_model.ecc = 0.0
+        p_model.w = 90.0
+        p_model.u = [0.3, 0.2]
+        p_model.limb_dark = "quadratic"
+
+        m_model = batman.TransitModel(p_model, t_model)
+        model_folded = m_model.light_curve(p_model)
+
+        # Fold the observed data centered at t0_fit into [-P/2, P/2)
+        time_arr = df['time'].values
+        flux_arr = df['flux_norm'].values if 'flux_norm' in df else df['flux'].values
+        phase_days = ((time_arr - t0_fit + 0.5 * p_bls) % p_bls) - 0.5 * p_bls
+
+        # Filter to requested view window
+        in_view = np.abs(phase_days) <= plot_window
+        t_view = phase_days[in_view]
+        f_view = flux_arr[in_view]
+        sort_view = np.argsort(t_view)
+        t_view = t_view[sort_view]
+        f_view = f_view[sort_view]
+
+        # Folded Fit Plot
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=t_view, y=f_view, mode='markers',
+            marker=dict(size=3, color='#94a3b8', opacity=0.45), name="Observed Photometry"
+        ))
+        fig.add_trace(go.Scatter(
+            x=t_model, y=model_folded, mode='lines',
+            line=dict(color='#38bdf8', width=2.5), name="Batman Physical Fit"
+        ))
+
+        fig = apply_layout(
+            fig,
+            title=f"Folded Transit Fit: TIC {tic} (Signal {planet_idx+1})",
+            x_title="Phase from Mid-Transit (Days)",
+            y_title="Relative Flux",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Residuals Plot (Observed - Calculated)
+        model_at_points = np.interp(t_view, t_model, model_folded)
+        res_flux = f_view - model_at_points
+        fig_res = go.Figure()
+        fig_res.add_trace(go.Scatter(
+            x=t_view, y=res_flux, mode='markers',
+            marker=dict(size=3, color='#f87171', opacity=0.45), name="Residuals (O - C)"
+        ))
+        fig_res.add_hline(y=0.0, line_dash="dash", line_color="rgba(148, 163, 184, 0.4)")
+        fig_res = apply_layout(
+            fig_res,
+            title=f"Fit Residuals: TIC {tic} (Signal {planet_idx+1})",
+            x_title="Phase from Mid-Transit (Days)",
+            y_title="Flux Delta (O - C)",
+        )
+        st.plotly_chart(fig_res, use_container_width=True)
+    else:
+        st.info("No fitting results yet for this target. Click '⚡ Fit Transit Model' above to optimize the physical parameters.")
+
+
 def page_performance():
     st.markdown(
         """
@@ -781,6 +1042,8 @@ def main():
         page_overview(metrics, evaluation)
     elif page == "Analyze":
         page_analyze(tic, files)
+    elif page == "Parameter Fitting":
+        page_fitting(tic, files)
     elif page == "Model Performance":
         page_performance()
 
