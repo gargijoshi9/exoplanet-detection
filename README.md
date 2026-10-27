@@ -1,439 +1,291 @@
-# Exoplanet Detection using Machine Learning
+# Exoplanet Detection using Machine Learning (ExoScope)
 
-This repository implements a pipeline for detecting and classifying exoplanet signals in noisy
-**TESS** (Transiting Exoplanet Survey Satellite) light curves.
+This repository implements an end-to-end astronomical pipeline for detecting, vetting, modeling, and classifying exoplanet transit signals in high-precision **TESS** (Transiting Exoplanet Survey Satellite) light curves.
 
-A light curve is a star's brightness measured over time. When a planet passes in front of its star,
-the brightness dips slightly. The aim is to find these periodic dips and to tell real planet transits apart
-from other signals, such as eclipsing binary stars and rejected planet candidates.
+A light curve records a star's brightness over time. When an orbiting planet transits across the stellar disk, the observed brightness dips periodically. The pipeline automates the discovery of these periodic transit dips and applies machine learning to distinguish true planetary transits from astrophysical false positives (such as eclipsing binary stars) and stellar variability.
+
+---
 
 ## Project Structure
 
 ```text
 exoplanet-detection/
 │
-├── data/
-│   │                         # NOTE: everything inside data/ and results/ is generated locally and is NOT in git
-│   ├── raw/                  # temporary FITS downloads (deleted automatically after processing)
-│   ├── processed/            # one TIC_<id>.npz file per star (created by preprocess.py)
-│   ├── full/                 # full 2-minute CSV for a single star (created by preprocess.py --full)
-│   ├── labels.csv            # star list: tic_id, label, source, train/test split (created by build_labels.py)
-│   ├── failed.csv            # stars that could not be processed, with the reason
-│   └── preprocess.log        # log of the preprocessing run
+├── data/                             # Generated locally (gitignored)
+│   ├── raw/                          # Temporary FITS downloads (cleaned automatically)
+│   ├── processed/                    # Preprocessed 10-min binned light curves: TIC_<id>.npz
+│   ├── full/                         # Full 2-min cadence light curves: processed_TIC_<id>.csv
+│   ├── features/                     # Extracted BLS transit features: bls_features.csv
+│   ├── features.csv                  # Extracted statistical light curve features
+│   ├── labels.csv                    # Catalog: tic_id, label, source, split
+│   ├── failed.csv                    # Diagnostic log of skipped/failed stars
+│   └── preprocess.log                # Execution log of data acquisition and preprocessing
 │
 ├── notebooks/
-│   └── detection.ipynb       # step-by-step walkthrough of the transit detection on TIC 307210830
+│   └── detection.ipynb               # Step-by-step BLS detection walkthrough on TIC 307210830
 │
 ├── src/
-│   ├── build_labels.py       # builds data/labels.csv from public catalogs
-│   ├── preprocess.py         # downloads and cleans light curves (all stars, or one star with --tic)
-│   ├── detect.py             # transit detection: BLS search, vetting, multi-planet masking
-│   ├── feature_extraction.py
-│   ├── extract_bls_features.py
-│   ├── train_classifier.py
-│   ├── train_final_model.py
-│   ├── evaluate.py
-│   ├── evaluate_final_model.py
-│   ├── predict.py
-│   └── dashboard_utils.py    # artifact loading for the Streamlit app
+│   ├── build_labels.py               # Downloads public catalogs & constructs data/labels.csv
+│   ├── preprocess.py                 # Ingestion, validation, cleaning, detrending, and caching
+│   ├── detect.py                     # BLS periodogram search, iterative masking, and vetting
+│   ├── fit.py                        # Physical transit parameter fitting using batman
+│   ├── feature_extraction.py         # Statistical & variability feature engineering
+│   ├── extract_bls_features.py       # First-signal BLS feature extractor
+│   ├── compare_models.py             # 5-fold CV comparison: Random Forest vs. LightGBM
+│   ├── train_final_model.py          # Trains final production LightGBM + BLS classifier
+│   ├── evaluate_final_model.py       # Evaluates model on held-out test split
+│   ├── predict.py                    # Standalone CLI prediction on any processed target
+│   └── dashboard_utils.py            # Artifact loaders & helpers for the Streamlit UI
 │
-├── app.py                    # Streamlit dashboard
+├── tests/
+│   └── test_preprocess.py            # Unit tests for preprocessing, caching, and validation
+│
+├── app.py                            # Interactive Streamlit dashboard
 ├── models/
+│   └── lightgbm_bls_pipeline.joblib  # Trained LightGBM classification pipeline
 ├── results/
-│   └── detection/            # detection tables and plots (created by detect.py)
+│   ├── detection/                    # Detection tables, periodograms, and fold plots
+│   └── fitting/                      # Fitted physical transit parameters
+├── reports/
+│   ├── model_comparison/             # Cross-validation metrics and confusion matrices
+│   └── final_evaluation/             # Test set evaluation predictions & feature importance
 ├── requirements.txt
 └── README.md
 ```
 
-## Streamlit dashboard
-
-The interactive dashboard is `app.py`. It reads artifacts from the repository root
-using `pathlib`, so it does not matter which directory you launch it from.
-
-```bash
-python -m venv venv
-source venv/bin/activate        # Linux / macOS
-venv\Scripts\activate           # Windows
-pip install -r requirements.txt
-python -m streamlit run app.py
-```
-
-Then open the URL printed in the terminal (typically http://localhost:8501).
-
-### Dashboard pages
-
-| Page | What it shows |
-|---|---|
-| Project overview | Target counts, candidate counts, class counts, and evaluation metrics computed from files that actually exist |
-| Light curve explorer | Processed flux vs time for a selected TIC, with error bars when `flux_err` is stored |
-| BLS detection | Saved detection tables and, optionally, a live `src/detect.py` run (this can take several minutes) |
-| ML classification | The saved `models/lightgbm_bls_pipeline.joblib` model, live inference, and held-out metrics when present |
-| Transit parameter fitting | Refines BLS detections using a physical `batman` model to estimate radius ratio, impact parameter, and mid-transit time |
-| Results and export | Searchable catalog and CSV download of displayed / per-target rows |
-
-The dashboard never fills missing photometry, detections, or scores with demo values.
-BLS and live classification run only after you submit the on-page form.
-
-### Files the dashboard looks for
-
-| Path | Role |
-|---|---|
-| `data/labels.csv` | Star list, class labels, train/test split |
-| `data/processed/TIC_<id>.npz` | Batch processed light curves |
-| `data/processed/processed_TIC_<id>.csv` or `data/full/processed_TIC_<id>.csv` | Full-cadence CSV light curves |
-| `data/features.csv` | Statistical features |
-| `data/features/bls_features.csv` | Saved first-signal BLS features |
-| `results/detection/<name>_detections.csv` | Per-target detection tables |
-| `results/detection/<name>_periodogram_<n>.png` | Periodogram images (arrays are not saved) |
-| `models/lightgbm_bls_pipeline.joblib` | LightGBM + BLS classifier |
-| `reports/final_evaluation/test_predictions.csv` | Held-out test predictions used for metrics |
-
-If a file is absent, the corresponding card shows **n/a** (unavailable), which is not the same as zero.
-
-In a typical fresh clone you will have the model file but not `labels.csv` or
-detection tables. One full-cadence light curve may exist locally as
-`data/processed/processed_TIC_307210830.csv` (columns `time`, `flux`, `flux_err`)
-even when `data/full/` is empty.
-
-### Dashboard limitations
-
-- Transit parameter fitting is not available; the fitting page states that explicitly.
-- Periodogram *arrays* exist only during an in-session BLS run. Saved detector output is a CSV plus PNG images.
-- Held-out accuracy / precision / recall / F1 are shown only if `reports/final_evaluation/test_predictions.csv` exists. `results/classification_report.txt` is a placeholder and is not treated as a metric source.
-- `predict_proba` values are model scores, not calibrated probabilities of being correct.
-- Large light curves are downsampled in plots only; summary statistics use the full series.
+---
 
 ## Setup & Installation
 
-1. Create and activate a virtual environment:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate        # Linux / macOS
-   venv\Scripts\activate           # Windows
-   ```
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+### 1. Clone the repository and enter the directory
+```bash
+git clone https://github.com/gargijoshi9/exoplanet-detection.git
+cd exoplanet-detection
+```
 
-An internet connection is needed for the data steps, because the catalogs and light curves are
-downloaded from NASA / MAST.
+### 2. Create and activate a Python virtual environment
+Python 3.10 to 3.13 is recommended.
 
-## Pipeline Status
+```bash
+python3 -m venv venv
 
-Status below is what the **code** in this repository implements. Whether a given
-checkout has the data files is a separate question: `data/labels.csv`, most
-processed NPZ files, detection CSVs, and `reports/final_evaluation/` are gitignored
-and must be created locally.
+# On macOS / Linux:
+source venv/bin/activate
 
-| Stage | Status |
-|---|---|
-| 1. Build labelled star list (`build_labels.py`) | Implemented |
-| 2. Download and preprocess light curves (`preprocess.py`) | Implemented |
-| 3. Transit detection (`detect.py`, `notebooks/detection.ipynb`) | Implemented |
-| 4. Transit parameter fitting (`src/fit.py`) | Implemented |
-| 5. Feature extraction (`feature_extraction.py`, `extract_bls_features.py`) | Implemented |
-| 6. Classifier training (`train_final_model.py`) | Implemented; `models/lightgbm_bls_pipeline.joblib` is versioned |
-| 7. Held-out evaluation (`evaluate_final_model.py`) | Implemented; writes `reports/final_evaluation/` (gitignored) |
-| 8. Streamlit dashboard (`app.py`) | Implemented |
+# On Windows (Command Prompt / PowerShell):
+venv\Scripts\activate
+```
+
+### 3. Install dependencies
+```bash
+pip install --upgrade pip
+pip install -r requirements.txt
+```
 
 ---
 
-## Getting the Data (read this first)
+## Complete Step-by-Step Running Instructions
 
-The data files are **not stored in this repository**. `.gitignore` excludes `data/raw/`, `data/processed/`,
-all `*.csv` files, all `*.png` files and `*.log` files, so after you pull you only have the code. You create the
-dataset on your own machine by running two scripts, in this order, from the repository root:
+Because raw telescope data and processed photometry are not versioned in git, follow these steps to build the dataset, extract features, train the model, and launch the interactive dashboard.
 
-```bash
-python src/build_labels.py                       # Step 1: makes data/labels.csv   (about 1 minute)
-python src/preprocess.py --workers 4             # Step 2: makes data/processed/   (about 20 to 30 minutes)
+```mermaid
+flowchart TD
+    A[NASA Exoplanet Archive & TESS-EBs] -->|src/build_labels.py| B[data/labels.csv]
+    B -->|src/preprocess.py| C[data/processed/TIC_*.npz]
+    C -->|src/detect.py| D[results/detection/]
+    D -->|src/fit.py| E[results/fitting/]
+    C -->|src/feature_extraction.py| F[data/features.csv]
+    C & D -->|src/extract_bls_features.py| G[data/features/bls_features.csv]
+    F & G -->|src/train_final_model.py| H[models/lightgbm_bls_pipeline.joblib]
+    H -->|src/evaluate_final_model.py| I[reports/final_evaluation/]
+    C & D & E & H -->|streamlit run app.py| J[Interactive Dashboard]
 ```
 
-Run them exactly as shown, without changing any options (the defaults are 50 stars per class, sampled with a
-fixed seed), so that you get the same stars as everyone else. You need an internet connection. Run Step 1 only
-once: running it again overwrites `data/labels.csv` with a new sampling.
+---
 
-### If some stars fail to download (very common)
+### Step 1: Build the Target Catalog (`src/build_labels.py`)
 
-The NASA / MAST servers sometimes time out. This is normal. **Just run Step 2 again**:
+Fetches confirmed and candidate planets from the **NASA Exoplanet Archive (TOI catalog)** and eclipsing binary stars from the **Villanova TESS-EBs catalog**.
 
 ```bash
+# Default: 50 target stars per class (with 1.6x oversampling = 240 candidates total)
+python src/build_labels.py
+```
+
+* **Scaling up**: To build a larger catalog, use `--n-per-class` (e.g. `--n-per-class 100` generates 480 candidate stars).
+* **Incremental preservation**: Re-running `build_labels.py` preserves 100% of previously generated stars and their assigned train/test splits.
+* **Extended mission sectors**: By default, `--max-toi 2000` is applied to match Primary Mission Sectors 1–26. Pass `--max-toi 0` if you want candidate stars alerted in later sectors.
+
+---
+
+### Step 2: Download & Preprocess Light Curves (`src/preprocess.py`)
+
+Downloads 2-minute cadence SPOC PDCSAP light curves from MAST via `lightkurve`, removes stellar variability with a Savitzky-Golay detrending filter, normalizes flux, and bins to 10-minute intervals.
+
+```bash
+# Standard batch run (downloads all candidates in parallel using 4 workers)
 python src/preprocess.py --workers 4
 ```
 
-It skips every star that is already done and only retries the ones that failed. Repeat until the log says
-that 0 stars are left "to process". If you see "file may be corrupt" errors that keep repeating, delete the
-folder `data/raw/mastDownload` and run Step 2 again. If you see other strange download errors, use
-`--workers 1`.
-
-Some stars are skipped on purpose and are **not errors**. They are written to `data/failed.csv` and never
-retried:
-
-- stars that have no 2-minute light curve (the log reason starts with "no 2-min"), and
-- stars whose first 2-minute sector is after sector 26 (the reason starts with "first sector").
-
-### How to check that you got the same data as the team
-
-After Step 1, `data/labels.csv` should have **240 rows (80 per class)**. After Step 2 has finished, the
-summary table printed at the end of the run (and in `data/preprocess.log`) should show about:
-
-| Class | Test | Train | Total |
-|---|---|---|---|
-| Eclipsing Binary | 20 | 58 | 78 |
-| Transit | 10 | 46 | 56 |
-| Other | 3 | 21 | 24 |
-| **All** | 33 | 125 | **158** |
-
-The star list is sampled from the live NASA catalogs (TOI table and TESS-EBs), using a fixed random seed.
-These numbers were produced in October 2026. If NASA has changed a star's disposition since then, your counts
-can differ by a few stars. That is acceptable, but tell the team if the difference is large.
-
-When loading data in code, always read the stars from `data/labels.csv`, never by listing the files in
-`data/processed/`.
+#### Key Capabilities & Options:
+* **Automatic Caching**: Any star that already has a valid `TIC_<id>.npz` file in `data/processed/` is **automatically validated and skipped**. It will not be re-downloaded or overwritten.
+* **Resilient Failure Logging**: Permanently unavailable targets (no 2-min SPOC cadence or sector $> 26$) are recorded in `data/failed.csv` and automatically skipped on subsequent runs.
+* **Pilot Test Mode**: Run on just 10 stars per class to quickly verify your pipeline:
+  ```bash
+  python src/preprocess.py --per-class 10 --workers 4
+  ```
+* **Unlock Extended Missions (Sectors $> 26$)**:
+  ```bash
+  python src/preprocess.py --max-sector 0 --retry-failed --workers 4
+  ```
+* **Single-Star Full Cadence (for high-resolution BLS / fitting)**:
+  Downloads multiple sectors at full 2-minute cadence (unbinned) and saves a CSV:
+  ```bash
+  python src/preprocess.py --tic 307210830 --sectors 8 9 10 11 12 --full
+  ```
 
 ---
 
-## Phase 1: Data Pipeline (labels and preprocessing)
+### Step 3: Run Transit Detection (`src/detect.py`)
 
-### 1. Why a labelled dataset of many stars
-
-A classifier learns from many examples. One star, even with many TESS sectors of data, is a single
-example, so the data was built from many stars, one light curve per star, each with a class label.
-
-### 2. Classes and where the labels come from
-
-| Class | Source | What it means |
-|---|---|---|
-| **Transit** | NASA Exoplanet Archive TOI table, dispositions CP / KP / PC | Confirmed, known or candidate planets |
-| **Eclipsing Binary** | TESS-EBs catalog (Prša et al. 2022) | Two stars eclipsing each other |
-| **Other** | NASA Exoplanet Archive TOI table, dispositions FP / FA | Looked like a planet candidate but was rejected |
-
-Rules that keep the labels clean:
-
-- A star with a planet-type TOI that is also in the EB catalog is **dropped** (ambiguous).
-- A star in the EB catalog is labelled Eclipsing Binary, even if it is also a rejected TOI.
-- "Other" never includes a star that has any planet-type TOI.
-
-**Why "Other" = rejected candidates:** these are the hard negatives. They are the signals that looked
-like planets and had to be ruled out, which is the case a classifier most needs to handle.
-
-### 3. Why the stars are matched by era (sectors 1 to 26)
-
-The TESS-EBs catalog only covers TESS sectors 1 to 26. When Transit and Other stars were first sampled
-without any restriction, most of them came from later sectors. A model could then learn "early sector means
-eclipsing binary" from instrument and noise differences, instead of learning the shape of the light curve.
-Predicting the class from the sector number alone scored 73% in cross-validation (the biggest class was
-37%).
-
-To fix this:
-
-- `build_labels.py` keeps only Transit / Other stars with a TOI number below 2000 (`--max-toi`), which were
-  mostly alerted from the early sectors.
-- `preprocess.py` then enforces the real rule: it skips any star whose first 2-minute sector is after
-  sector 26 (`--max-sector`).
-
-After the fix, the sector number alone scores 39% in cross-validation, below the 49% you get by always
-guessing the biggest class. The shortcut is gone.
-
-### 4. Preprocessing steps (per star)
-
-Implemented in `src/preprocess.py` and applied to every star:
-
-1. **Download** the 2-minute SPOC light curve (PDCSAP flux) with `lightkurve`. Only **one sector per star**
-   is used (the earliest one), so one star is one sample.
-2. **Remove NaNs.** Stars with fewer than 5,000 valid points are rejected.
-3. **Remove outliers:** upper 5σ and lower 10σ. The lower limit is loose on purpose, so real transits
-   (downward dips) are not clipped.
-4. **Flatten** with a Savitzky-Golay filter (window of 301 cadences, about 10 hours) to remove slow stellar
-   and instrument trends.
-5. **Normalize** so the median flux is 1.
-6. **Bin to 10-minute cadence.** This shrinks each file about five times and keeps the later feature
-   extraction fast.
-
-Two flux columns are saved:
-
-- `flux`: detrended and normalized. Use this for detection, features and classification.
-- `flux_norm`: normalized but not detrended. Kept so that later stages (such as transit fitting) can
-  re-flatten with the transit masked, because flattening without a mask slightly reduces the transit depth.
-
-### 5. Train / test split
-
-The split is done **by star**, about 80 / 20, and depends only on the star ID and a fixed seed. This means:
-
-- no star appears in both train and test;
-- adding more stars later does not move existing stars between train and test.
-
-### 6. Final dataset
-
-| Class | Test | Train | Total |
-|---|---|---|---|
-| Eclipsing Binary | 20 | 58 | 78 |
-| Transit | 10 | 46 | 56 |
-| Other | 3 | 21 | 24 |
-| **All** | 33 | 125 | **158** |
-
-240 stars were sampled (80 per class). Of the 82 not in the final set, 19 have no 2-minute data and 63
-first appeared after sector 26. All 158 files were checked: no NaNs, increasing timestamps, and at least
-2,214 points each.
-
-### 7. Optional: one star at full 2-minute cadence
-
-The detection phase works best on a long, full-cadence light curve of one star. This command downloads
-sectors 8 to 12 of TIC 307210830 (the L 98-59 system), keeps the 2-minute cadence and writes a CSV:
+Executes a Box Least Squares (BLS) periodogram search with iterative signal masking to discover multi-planet candidates and evaluate automated vetting criteria.
 
 ```bash
-python src/preprocess.py --tic 307210830 --sectors 8 9 10 11 12 --full
-```
+# Run detection on a single processed target
+python src/detect.py --npz data/processed/TIC_1129452.npz
 
-It writes `data/full/processed_TIC_307210830.csv` with the columns `time, flux, flux_err, flux_norm`
-(75,041 points over about 135 days). It takes about 1 to 3 minutes, depending on your internet speed and
-how busy MAST is. If it fails with a timeout or a "file may be corrupt" error, delete `data/raw/mastDownload`
-and run the same command again.
-
-### 8. Loading the processed data in Python
-
-Always read stars from `labels.csv`, because `data/processed/` may also contain files from earlier runs.
-
-```python
-import sys; sys.path.insert(0, "src")
-import pandas as pd
-from preprocess import load_star
-
-labels = pd.read_csv("data/labels.csv")
-star = load_star(labels.tic_id.iloc[0])     # DataFrame: time, flux, flux_err, flux_norm
-```
-
----
-
-## Phase 2: Transit Detection
-
-Implemented in `src/detect.py`. The walkthrough with plots is in `notebooks/detection.ipynb`.
-
-**Input:** a preprocessed (detrended, normalized) light curve: `time` [days], `flux`, `flux_err`.
-**Output:** a table with one row per periodic signal found (period, mid-transit time, duration, depth, SNR
-and vetting results), plus plots.
-
-### How it works
-
-1. **Bin** the light curve to 10 minutes for a fast search. If the data is already binned, this is skipped.
-2. **Run Box Least Squares (BLS)** on a log-spaced period grid (0.5 days up to half the data length, capped
-   at 40 days). The grid is made fine enough that the phase drift over the whole data set stays below one
-   third of the shortest transit duration, so a real transit is not smeared out.
-3. **Take the highest peak.** If its signal-to-noise ratio (SNR) is below 7.1, stop. This is the same
-   threshold the TESS pipeline uses for a threshold crossing event.
-4. **Refine** period, mid-transit time and duration with a narrow BLS search on the full-cadence data.
-5. **Vet** the signal (see below).
-6. **Mask** the transits of that signal (±1 duration around each one) and go back to step 2 to look for the
-   next planet. This repeats up to 4 times (`--max-planets`).
-
-### Vetting checks
-
-| Check | Limit | What it catches |
-|---|---|---|
-| Number of transits | at least 2 | single events and noise spikes |
-| Odd / even depth difference | below 3σ | eclipsing binaries (odd and even eclipses differ) |
-| Secondary eclipse | below 3σ | eclipsing binaries (a second dip half an orbit later) |
-| Depth | below 5% | stellar eclipses, which are far deeper than planets |
-| Duration / period | below 0.1 | signals that are too long to be a planet transit |
-
-The red-noise SNR (`snr_red`) is also reported. It accounts for correlated noise, so it is more honest than
-the plain SNR when the star is variable.
-
-### How to run
-
-```bash
-# the multi-sector star made in Phase 1, step 7 (takes about 4 to 5 minutes)
+# Or run detection on a full-cadence CSV
 python src/detect.py --csv data/full/processed_TIC_307210830.csv
-
-# a star from the classification dataset
-python src/detect.py --npz data/processed/TIC_101961987.npz
 ```
 
-| Option | Meaning |
-|---|---|
-| `--max-planets N` | maximum number of signals to search for (default 4) |
-| `--min-snr X` | SNR threshold to stop the search (default 7.1) |
-| `--period-max D` | largest period to search, in days |
-| `--out DIR` | output folder (default `results/detection`) |
-
-For each input, `detect.py` writes into `results/detection/`:
-
-- `<name>_detections.csv`: the result table;
-- `<name>_overview.png`: the full light curve with the detected transits marked;
-- `<name>_periodogram_<n>.png`: the BLS periodogram for each signal;
-- `<name>_fold_<n>.png`: the light curve folded on each signal's period.
-
-These files are generated locally and are not in git.
-
-### Result table columns
-
-| Column | Meaning |
-|---|---|
-| `planet` | order in which the signal was found (strongest first) |
-| `period_d`, `t0_btjd`, `duration_h`, `depth_ppm` | BLS estimates of the period, mid-transit time (BTJD), duration and depth |
-| `snr`, `snr_red`, `sde` | signal-to-noise, red-noise signal-to-noise, signal detection efficiency |
-| `n_transits` | number of transits covered by the data |
-| `odd_even_sigma`, `secondary_sigma` | results of the two eclipsing-binary tests |
-| `flags` | any vetting check that failed |
-| `accepted` | the signal passed the SNR threshold |
-| `status` | `candidate` (passed everything), `flagged` (SNR ok but a vetting check failed) or `rejected` (below the SNR threshold) |
-
-### Result on the benchmark star (TIC 307210830, L 98-59 / TOI-175)
-
-L 98-59 is a bright M dwarf with three confirmed terrestrial planets, so it is a good test of multi-planet
-detection.
-
-| Signal | Period (d) | Duration (h) | Depth (ppm) | SNR | Transits | Status |
-|---|---|---|---|---|---|---|
-| 1 | 3.6908 | 1.11 | 1367 | 55.5 | 30 | candidate |
-| 2 | 7.4505 | 0.68 | 1333 | 31.0 | 16 | candidate |
-| 3 | 2.2531 | 0.90 | 515 | 23.5 | 46 | candidate |
-| 4 | 1.0491 | 1.24 | 177 | 13.3 | 94 | flagged (secondary eclipse) |
-
-Signals 1 to 3 match the three confirmed planets. Signal 4 is flagged by the secondary-eclipse test and is
-most likely a false positive, so the vetting is doing its job.
-
-### Known limitations of the detection phase
-
-- **BLS gives a box-shaped estimate.** Period, duration and depth are good starting values, but they carry
-  no uncertainties, and the planet-to-star radius ratio, impact parameter and similar quantities are not
-  estimated. That is the job of the parameter fitting stage.
-- **Detrending bias.** The `flux` column was flattened without a transit mask, so depths are slightly
-  underestimated. Re-flatten `flux_norm` with the transits masked before fitting.
-- **One sector per star in the classification dataset.** Planets with long periods may show only one
-  transit, or none, in a single sector, so the vetting (which needs at least 2 transits) can reject them.
-- **Weak signals in noisy stars.** For example, TIC 101961987 gives a best peak with SNR 2.5, which is
-  correctly rejected as noise.
+Outputs written to `results/detection/`:
+* `<name>_detections.csv`: Summary table of detected period, duration, depth, SNR, SDE, and vetting status (`candidate`, `flagged`, `rejected`).
+* `<name>_overview.png`: Entire light curve with marked transit ingress/egress.
+* `<name>_periodogram_<n>.png`: BLS periodogram showing candidate spectral peaks.
+* `<name>_fold_<n>.png`: Light curve folded on the detected orbital period.
 
 ---
 
-## Known limitations of the dataset
+### Step 4: Fit Physical Transit Parameters (`src/fit.py`)
 
-- **Small "Other" class (24 stars).** Results for this class are only indicative. A fixed test split has just
-  3 Other stars, so use stratified cross-validation over all stars and report per-class precision, recall
-  and F1, not only accuracy.
-- **Class imbalance (78 / 56 / 24).** Use balanced class weights.
-- **Label noise.** Catalog labels are not perfect, and candidate (PC) stars are not all confirmed planets.
-- **One sector per star.** See the detection limitations above.
+Refines the detected transit using the physical **batman** (Bad-Ass Transit Model Calculation) analytical model with non-linear least squares optimization. It estimates the planet-to-star radius ratio ($R_p/R_*$), impact parameter ($b$), scaled semi-major axis ($a/R_*$), and mid-transit epoch ($T_0$).
+
+```bash
+python src/fit.py --tic 1129452
+```
+
+Outputs written to `results/fitting/TIC_<id>_fit_params.csv`.
 
 ---
 
-## Completed Work
+### Step 5: Feature Extraction (`src/feature_extraction.py` & `src/extract_bls_features.py`)
 
-1. **Transit parameter fitting** (starting from the BLS values and using `batman`): fit the radius ratio, impact
-   parameter, scaled semi-major axis and mid-transit time with uncertainties, re-flattening `flux_norm` with
-   the transits masked.
-2. **Regenerate local artifacts** on machines that only have the code: `labels.csv`, processed NPZ files,
-   `data/features.csv`, `data/features/bls_features.csv`, detection CSVs, and
-   `reports/final_evaluation/test_predictions.csv`.
-3. **Optional:** persist a BLS run from the dashboard (checkbox on the detection page) so overview counts
-   can be computed from `results/detection/` instead of only from an in-session table.
+Computes both statistical light curve features and first-signal BLS transit features across all processed light curves:
 
-## Data Sources
+```bash
+# 1. Statistical features (skewness, kurtosis, variance, robust amplitude, percentiles)
+python src/feature_extraction.py
 
-- TESS mission data (SPOC pipeline, 2-minute cadence) from MAST, accessed with
-  [lightkurve](https://docs.lightkurve.org/).
-- TESS Objects of Interest (TOI) table, NASA Exoplanet Archive.
-- TESS Eclipsing Binary catalog: Prša et al. 2022, *TESS Eclipsing Binary Stars. I. Short-cadence
-  Observations of 4584 Eclipsing Binaries in Sectors 1 to 26*, ApJS 258, 16 (VizieR `J/ApJS/258/16`).
+# 2. BLS transit features (period, depth, duration, SNR, SDE, odd-even symmetry)
+python src/extract_bls_features.py
+```
+
+Outputs saved to:
+* `data/features.csv`
+* `data/features/bls_features.csv`
+
+---
+
+### Step 6: Train & Evaluate the Machine Learning Classifier
+
+Train the production LightGBM classifier combining both statistical and transit features, followed by held-out test evaluation:
+
+```bash
+# 1. Train the classifier (saves to models/lightgbm_bls_pipeline.joblib)
+python src/train_final_model.py
+
+# 2. Evaluate performance on the held-out test split
+python src/evaluate_final_model.py
+```
+
+Outputs saved to `reports/final_evaluation/`:
+* `test_predictions.csv`: Actual vs. predicted labels for the test split.
+* `feature_importance.csv`: Ranked importance of all engineered features.
+
+To compare cross-validation performance between Random Forest and LightGBM:
+```bash
+python src/compare_models.py
+```
+
+---
+
+### Step 7: Launch the Interactive Web Dashboard (`app.py`)
+
+Launch the modern **ExoScope** Streamlit dashboard:
+
+```bash
+streamlit run app.py
+```
+
+Open the local browser URL (typically `http://localhost:8501`).
+
+#### Dashboard Pages:
+1. **Overview**: Dataset metrics, class breakdown, train/test distributions, and pipeline status.
+2. **Analyze**: Interactive Plotly light curve explorer (zoom, pan, error bars), phase-folded views, periodograms, and live BLS / ML inference on any target.
+3. **Parameter Fitting**: Physical transit modeling using `batman`, interactive overlay of best-fit transit model, residual analysis, and parameter export.
+4. **Model Performance**: Cross-validation benchmark metrics, confusion matrices, precision/recall/F1 breakdowns, and feature importance rankings.
+
+---
+
+### Step 8: Run Automated Unit Tests
+
+A comprehensive unit test suite is provided to verify observation selection, caching, validation, retry logic, and schema compatibility offline without requiring active MAST network calls:
+
+```bash
+python -m pytest tests/ -v
+```
+
+---
+
+## Preprocessing Pipeline Architecture
+
+Implemented in `src/preprocess.py`:
+
+1. **Pre-Download Search & Filtering**:
+   Queries TESS SPOC 120-second cadence metadata before requesting FITS payloads. Filters out missing or malformed sector headers.
+2. **Deterministic Observation Selection**:
+   Filters for observations within the configured era (`--max-sector 26` by default) and picks the earliest available sector deterministically.
+3. **Array Validation**:
+   Checks that the downloaded product contains valid, finite `pdcsap_flux` values.
+4. **Outlier Rejection**:
+   Applies asymmetric sigma-clipping ($5\sigma$ upper, $10\sigma$ lower) to reject instrument flares while preserving deep planetary transit dips.
+5. **Detrending & Normalization**:
+   Applies a Savitzky-Golay filter (window length 301 cadences, polynomial order 2) to remove low-frequency stellar activity.
+6. **Cadence Binning**:
+   Bins to 10-minute cadence for fast feature extraction in batch mode (`flux`), while preserving unflattened flux (`flux_norm`) for masked re-flattening during physical transit fitting.
+7. **Atomic Write & Integrity Verification**:
+   Saves to a temporary file, verifies that array dimensions match and values are finite, and atomically moves the archive into `data/processed/TIC_<id>.npz`.
+
+---
+
+## Scientific Background & Vetting Checks
+
+During transit detection (`src/detect.py`), every candidate signal is subjected to astronomical vetting checks:
+
+| Vetting Check | Threshold | Description |
+|---|---|---|
+| **Transit Multiplicity** | $\ge 2$ transits | Rejects single noise spikes and instrumental glitches. |
+| **Odd/Even Consistency** | $< 3\sigma$ | Detects eclipsing binary stars (secondary eclipses create alternating depths). |
+| **Secondary Eclipse Check** | $< 3\sigma$ | Checks for a secondary occultation dip at phase 0.5. |
+| **Transit Depth Limit** | $< 50{,}000\text{ ppm}$ ($5\%$) | Stellar eclipses are typically far deeper than planetary transits. |
+| **Duty Cycle Ratio** | Duration / Period $< 0.1$ | Excludes long-duration stellar variations that cannot be Keplerian transits. |
+| **Red Noise SNR** | Reported (`snr_red`) | Accounts for correlated noise using the Allan variance of the out-of-transit flux. |
+
+---
+
+## Data Catalogs & Citations
+
+* **TESS Photometry**: NASA Transiting Exoplanet Survey Satellite (SPOC 2-minute cadence data), accessed via [Lightkurve](https://docs.lightkurve.org/).
+* **TOI Catalog**: NASA Exoplanet Archive TESS Objects of Interest (TOI) table (CP, KP, PC, FP, FA dispositions).
+* **TESS-EBs Catalog**: Prša et al. 2022, *TESS Eclipsing Binary Stars. I. Short-cadence Observations of 4584 Eclipsing Binaries in Sectors 1 to 26*, ApJS 258, 16 ([VizieR J/ApJS/258/16](https://cdsarc.cds.unistra.fr/viz-bin/cat/J/ApJS/258/16)).
+* **Transit Modeling**: `batman` analytical transit light curve model ([Kreidberg 2015](https://ui.adsabs.harvard.edu/abs/2015PASP..127.1161K/abstract)).

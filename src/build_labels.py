@@ -153,20 +153,47 @@ def star_hash(tic_id, seed) -> float:
 
 
 def sample_and_split(labels: pd.DataFrame, n_per_class: int, oversample: float,
-                     test_frac: float, seed: int) -> pd.DataFrame:
-    """Sample stars per class (a bit more than needed, some will fail to download) and split by star."""
+                     test_frac: float, seed: int, existing_path: Path | None = None) -> pd.DataFrame:
+    """Sample stars per class. If existing_path exists, keeps existing stars and adds new candidates to reach target."""
     rng = np.random.default_rng(seed)
     n_take = int(round(n_per_class * oversample))
+    
+    existing_df = None
+    if existing_path and Path(existing_path).exists():
+        try:
+            existing_df = pd.read_csv(existing_path)
+            print(f"Preserving {len(existing_df)} existing stars from {existing_path} ...")
+        except Exception:
+            existing_df = None
+
     parts = []
     for label, grp in labels.groupby("label"):
-        idx = rng.permutation(len(grp))[:n_take]
-        grp = grp.iloc[idx].copy()
-        # The split depends only on (seed, star id), so asking for more stars later
-        # never moves an existing star between train and test.
-        grp["split"] = [
-            "test" if star_hash(t, seed) < test_frac else "train" for t in grp["tic_id"]
-        ]
-        parts.append(grp)
+        existing_class_df = None
+        existing_tics = set()
+        if existing_df is not None and "label" in existing_df.columns:
+            existing_class_df = existing_df[existing_df["label"] == label].copy()
+            existing_tics = set(existing_class_df["tic_id"].astype("int64"))
+
+        # Available candidates not already chosen
+        grp_new = grp[~grp["tic_id"].isin(existing_tics)].copy()
+        needed = max(0, n_take - len(existing_tics))
+
+        if needed > 0 and len(grp_new) > 0:
+            idx = rng.permutation(len(grp_new))[:needed]
+            sampled_new = grp_new.iloc[idx].copy()
+            sampled_new["split"] = [
+                "test" if star_hash(t, seed) < test_frac else "train" for t in sampled_new["tic_id"]
+            ]
+        else:
+            sampled_new = pd.DataFrame(columns=grp.columns.tolist() + ["split"])
+
+        if existing_class_df is not None and len(existing_class_df) > 0:
+            combined = pd.concat([existing_class_df, sampled_new], ignore_index=True)
+        else:
+            combined = sampled_new
+
+        parts.append(combined)
+
     out = pd.concat(parts, ignore_index=True)
     return out.sort_values(["label", "tic_id"]).reset_index(drop=True)
 
@@ -174,7 +201,7 @@ def sample_and_split(labels: pd.DataFrame, n_per_class: int, oversample: float,
 # ----------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--n-per-class", type=int, default=50, help="target stars per class (default 150)")
+    ap.add_argument("--n-per-class", type=int, default=50, help="target stars per class (default 50)")
     ap.add_argument("--oversample", type=float, default=1.6,
                     help="take this factor more stars, since some have no 2-min data (default 1.6)")
     ap.add_argument("--max-toi", type=int, default=MAX_TOI_DEFAULT,
@@ -183,6 +210,7 @@ def main():
     ap.add_argument("--test-frac", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--eb-csv", default=None, help="CSV with a TIC column, instead of downloading from VizieR")
+    ap.add_argument("--fresh", action="store_true", help="ignore existing labels.csv and resample from scratch")
     ap.add_argument("--out", default=str(OUT_PATH))
     args = ap.parse_args()
 
@@ -194,7 +222,8 @@ def main():
     for k, v in counts.items():
         print(f"  {k:<20} {v}")
 
-    chosen = sample_and_split(labels, args.n_per_class, args.oversample, args.test_frac, args.seed)
+    existing_to_check = None if args.fresh else Path(args.out)
+    chosen = sample_and_split(labels, args.n_per_class, args.oversample, args.test_frac, args.seed, existing_to_check)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     chosen.to_csv(args.out, index=False)
 
