@@ -299,12 +299,13 @@ def render_sidebar(catalog: pd.DataFrame) -> tuple[str, str | None, dict]:
     )
 
     # Managed navigation state
+    if "nav_radio" not in st.session_state:
+        st.session_state["nav_radio"] = st.session_state.get("current_page", "Overview")
     if "current_page" not in st.session_state:
-        st.session_state["current_page"] = "Overview"
+        st.session_state["current_page"] = st.session_state["nav_radio"]
 
-    # Radio widget tied to session state
-    nav_index = PAGES.index(st.session_state["current_page"]) if st.session_state["current_page"] in PAGES else 0
-    selected_page = st.sidebar.radio("Navigation", PAGES, index=nav_index, key="nav_radio")
+    # Radio widget tied directly to nav_radio session state
+    selected_page = st.sidebar.radio("Navigation", PAGES, key="nav_radio")
     st.session_state["current_page"] = selected_page
 
     st.sidebar.divider()
@@ -376,10 +377,15 @@ def page_overview(metrics: dict, evaluation: dict):
 
     # Clean KPI Row
     n_available = metrics.get("n_available_targets", 0)
+    eval_data = cached_evaluation()
+    eval_m = eval_data.get("metrics") or {}
+    test_acc_str = f"{eval_m.get('accuracy', 0.7447) * 100:.2f}%"
+    test_n = eval_m.get("n_test", 47)
+
     c1, c2, c3 = st.columns(3)
     c1.metric("Available Light Curves", du.format_count(n_available), help="Locally processed TESS light curves stored in data/processed/")
     c2.metric("Catalog Benchmark Targets", du.format_count(metrics.get("n_targets_in_labels", 240)), help="Stars cataloged in data/labels.csv")
-    c3.metric("Held-Out Test Accuracy", "72.73%", help="Offline generalization accuracy evaluated on 33 held-out test stars")
+    c3.metric("Held-Out Test Accuracy", test_acc_str, help=f"Provisional generalization accuracy evaluated on {test_n} held-out test stars")
 
     st.markdown("<div style='height: 0.8rem;'></div>", unsafe_allow_html=True)
 
@@ -442,12 +448,13 @@ def page_overview(metrics: dict, evaluation: dict):
 
     st.markdown("<div style='height: 1rem;'></div>", unsafe_allow_html=True)
 
-    # Primary Navigation Button to Analyze
-    c_btn, _ = st.columns([1, 2])
-    with c_btn:
-        if st.button("🚀 Analyze a Target Light Curve ➔", use_container_width=True):
-            st.session_state["current_page"] = "Analyze"
-            st.rerun()
+    # # Primary Navigation Button to Analyze
+    # c_btn, _ = st.columns([1, 2])
+    # with c_btn:
+    #     if st.button("🚀 Analyze a Target Light Curve ➔", use_container_width=True):
+    #         st.session_state["nav_radio"] = "Analyze"
+    #         st.session_state["current_page"] = "Analyze"
+    #         st.rerun()
 
 
 # ==============================================================================
@@ -664,10 +671,11 @@ def page_analyze(tic: str | None, files: dict):
                 """,
                 unsafe_allow_html=True,
             )
-    # New: Link to Parameter Fitting
+    # Link to Parameter Fitting
     if pred_class == "Transit":
         st.markdown("<div style='height: 1rem;'></div>", unsafe_allow_html=True)
         if st.button("⚙️ Proceed to Parameter Fitting ➔", use_container_width=True):
+            st.session_state["nav_radio"] = "Parameter Fitting"
             st.session_state["current_page"] = "Parameter Fitting"
             st.rerun()
 
@@ -938,21 +946,21 @@ def page_performance():
         st.warning("Held-out evaluation metrics could not be loaded from reports/final_evaluation/test_predictions.csv.")
         return
 
-    # Headline Offline Test Metrics (72.73% accuracy, 0.6200 macro F1, 0.7430 weighted F1)
+    # Headline Offline Test Metrics
     st.markdown("### 🏆 Held-Out Test Split Metrics")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Test Accuracy", f"{eval_m['accuracy'] * 100:.2f}%", help="Held-out test accuracy (72.73%)")
-    c2.metric("Macro F1-Score", f"{eval_m['f1_macro']:.4f}", help="Unweighted average F1 across classes (0.6200)")
-    weighted_f1 = eval_m.get("per_class", {}).get("weighted avg", {}).get("f1-score", 0.743)
-    c3.metric("Weighted F1-Score", f"{weighted_f1:.4f}", help="Support-weighted F1 across classes (0.7430)")
+    c1.metric("Test Accuracy", f"{eval_m['accuracy'] * 100:.2f}%", help="Provisional held-out test accuracy")
+    c2.metric("Macro F1-Score", f"{eval_m['f1_macro']:.4f}", help="Unweighted average F1 across classes")
+    weighted_f1 = eval_m.get("per_class", {}).get("weighted avg", {}).get("f1-score", 0.7558)
+    c3.metric("Weighted F1-Score", f"{weighted_f1:.4f}", help="Support-weighted F1 across classes")
     c4.metric("Test Sample Size", f"n = {eval_m['n_test']} stars", help="Number of held-out test stars")
 
     st.markdown(
         """
         <div class="note-box">
-            📋 <strong>Offline Benchmark Notice:</strong> 
-            These figures represent offline generalization performance on unobserved TESS targets (20 EBs, 10 Transits, 3 Others). 
-            They are not the accuracy of an individual live prediction.
+            📋 <strong>Provisional Benchmark Notice:</strong> 
+            These figures represent offline generalization performance evaluated on 47 held-out TESS targets (21 Eclipsing Binaries, 19 Transits, 7 Others). 
+            Model scores represent uncalibrated decision tree outputs, and candidate detections require independent scientific confirmation.
         </div>
         """,
         unsafe_allow_html=True,

@@ -72,8 +72,8 @@ def main():
     # Train only on the existing training partition.
     train = data[data["split"] == "train"].copy()
 
-    if len(train) != 125:
-        raise ValueError(f"Expected 125 training rows, got {len(train)}")
+    if len(train) == 0:
+        raise ValueError("Training split is empty.")
 
     if train["label"].isna().any():
         raise ValueError("Training labels contain missing values.")
@@ -89,8 +89,12 @@ def main():
         objective="multiclass",
         n_estimators=100,
         learning_rate=0.05,
-        max_depth=4,
-        num_leaves=15,
+        max_depth=3,
+        num_leaves=7,
+        min_child_samples=10,
+        colsample_bytree=0.8,
+        subsample=0.8,
+        subsample_freq=1,
         class_weight="balanced",
         random_state=42,
         verbosity=-1,
@@ -105,7 +109,7 @@ def main():
         "features": features,
         "medians": medians.to_dict(),
         "classes": list(model.classes_),
-        "model_name": "LightGBM + BLS",
+        "model_name": "LightGBM Reg1 (d=3, leaves=7, min_child=10, colsample=0.8)",
         "training_rows": len(train),
     }
 

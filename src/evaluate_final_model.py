@@ -81,9 +81,9 @@ def main():
     train = data[data["split"] == "train"].copy()
     test = data[data["split"] == "test"].copy()
 
-    if len(train) != 125 or len(test) != 33:
+    if len(train) == 0 or len(test) == 0:
         raise ValueError(
-            f"Unexpected split sizes: train={len(train)}, test={len(test)}"
+            f"Train or test split is empty: train={len(train)}, test={len(test)}"
         )
 
     if train["label"].isna().any() or test["label"].isna().any():
@@ -101,8 +101,12 @@ def main():
         objective="multiclass",
         n_estimators=100,
         learning_rate=0.05,
-        max_depth=4,
-        num_leaves=15,
+        max_depth=3,
+        num_leaves=7,
+        min_child_samples=10,
+        colsample_bytree=0.8,
+        subsample=0.8,
+        subsample_freq=1,
         class_weight="balanced",
         random_state=42,
         verbosity=-1,

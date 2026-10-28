@@ -102,3 +102,5 @@ venv312/
 __pycache__/
 *.pyc
 tests/
+
+experiments/
